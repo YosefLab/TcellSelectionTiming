@@ -5,4 +5,6 @@ Lydia K Lutes, Zoë Steier, Laura L McIntyre, Shraddha Pandey, James Kaminski, A
 
 eLife, 2021. https://doi.org/10.7554/eLife.65435
 
-This repository contains code for the analysis performed in the above manuscript.
+This repository contains code for the analysis performed in this manuscript and the relevant results files.
+
+The RNA-seq data generated in this manuscript are accessible through GEO: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE164896.
