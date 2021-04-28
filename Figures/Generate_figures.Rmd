@@ -1,0 +1,418 @@
+---
+title: "Generate figures for RNA-seq data"
+output: html_notebook
+---
+
+Zoë Steier
+
+RNA-seq analysis of T cell self reactivity and positive selection in TCR transgenics.
+
+# Load packages
+```{r Load required packages, message=FALSE, warning=FALSE}
+# for DESeq2
+library(DESeq2)
+library(tximport)
+library(tidyverse)
+
+# for plotting
+library(viridis)
+library(pheatmap)
+library(pals)
+library(RColorBrewer)
+```
+
+# Load data
+
+```{r Load metadata for all samples}
+c_strConfig <- "data/ConfigFile_RobeyTCR.tab"
+
+# Make dfConditions - This is the metadata for these samples.
+dfConditions <- data.frame(read_tsv(c_strConfig,comment="#"))
+rownames(dfConditions) <- dfConditions$strSampleName
+dfConditions$strCellType <- str_replace(dfConditions$strCellType," ","_")
+
+# Sort metadata and expression data.
+dfConditions <- dfConditions[order(dfConditions$strSampleName),]
+
+dfConditions$strDay = str_replace(dfConditions$strTimePoint,"-CL.*","")
+dfConditions$strDay = paste0("Day",dfConditions$strDay)
+
+dfConditions$strTCRandDay = paste(dfConditions$strTCR,dfConditions$strDay,sep=".")
+
+cat(unique(dfConditions$strTCRandDay))
+
+dfConditions$RepGroup <- dfConditions$strTCRandDay
+
+dfConditions$strTCRType = factor(dfConditions$strTCRType,levels=c("F5","OT1","TG6","CD8_polyclonal","2D2","AND","OT2","CD4_polyclonal"))
+dfConditions$RepGroup <- paste(dfConditions$strTCRType,dfConditions$strCellType,dfConditions$strCellSort,sep=" - ")
+
+dfConditions[1:5,]
+```
+
+```{r Filter metadata for select samples}
+# Selected samples: OT1, F5, TG6
+all_coldata <- dfConditions[dfConditions$strTCRType %in% c("OT1", "F5", "TG6"),]
+row.names(all_coldata)
+
+dim(all_coldata)
+```
+
+```{r Load RNAseq count data}
+# Load RSEM Count Data
+### Note: future users should obtain this data from GEO: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE164896
+
+# This is a unix 'glob' pattern to get all of your samples. Print out this variable, and make sure it has all of your files.
+astrRSEMGeneResults <- Sys.glob("/data/yosef2/RobeyLab/TCRtoCD4OrCD8/out/RNASeq_Round*/IndividualSamples/*/rsem_output/rsem_output.genes.results") 
+
+# This part will vary from project to project. The function here splits the absolute path to the rsem file by "/", and tries 
+# to retrieve the part that refers to to sample name. Please change  "x[9]"" to refer to the part of the path that has the 
+# name. For example: If your pattern is "/data/yosef/project/data/sample1/rsem_output.genes.results". You will want to use
+# x[6] to retrieve "sample1". (R counts starting at 1, and the first spot is array this array would be empty.)
+vstrNames <- unlist(lapply( str_split(astrRSEMGeneResults,pattern="/"), function(x) x[9])) 
+
+names(astrRSEMGeneResults) <- vstrNames
+astrRSEMGeneResults <- astrRSEMGeneResults[order(vstrNames)]
+
+# Can filter out samples if needed. Here I cut these down to just samples in dfConditions.
+astrRSEMGeneResults_all <- astrRSEMGeneResults[names(astrRSEMGeneResults) %in% all_coldata$strSampleName]
+txi.rsem_all <- tximport(astrRSEMGeneResults_all, type = "rsem")
+```
+
+```{r Load gene names}
+dfGenes <-read.table("/data/yosef/index_files/mm10/rsem_files/mm10std_Ensemble_RSEM_Dictionary.tab",sep="\t",comment.char="#")
+colnames(dfGenes) <- c("ID","GeneName","GeneType")
+```
+
+# Filter and save data 
+
+## Minimally filter the dataset
+```{r Filter dataset}
+txi.rsem = txi.rsem_all
+txi.rsem$length[txi.rsem$length == 0] <- 1
+dedsRNASeq <- DESeqDataSetFromTximport(txi.rsem, # un-normalized read counts from RSEM output
+                                 colData = all_coldata,
+                                 design = ~ strTCRandDay)
+
+# Annotate data with gene names
+dfGenes<- dfGenes[match(rownames(dedsRNASeq), dfGenes$ID),]
+dfGenes$GeneName <- make.unique(as.character(dfGenes$GeneName)) 
+
+all(rownames(dedsRNASeq) == dfGenes$ID)
+mcols(dedsRNASeq) <- cbind(mcols(dedsRNASeq), dfGenes)
+rownames(dedsRNASeq) <- dfGenes$GeneName
+
+# Filter based on minimum reads
+keep <- rowSums(counts(dedsRNASeq)) >= 10 # Keep genes that have at least 10 reads total
+dedsRNASeq_filt <- dedsRNASeq[keep, ]
+dim(dedsRNASeq_filt) 
+dim(dedsRNASeq) 
+```
+
+## Information for data uploaded to GEO
+```{r Save raw data for GEO}
+# # Save raw counts in the form of txi.rsem, since this can be used for DESeq2 (normalized counts can't be used for DESEq2)
+# 
+# names(txi.rsem)
+# txi.rsem$abundance[1:5, 1:5]
+# txi.rsem$counts[1:5, 1:5]
+# txi.rsem$length[1:5, 1:5]
+# txi.rsem$countsFromAbundance # "no"
+# colnames(txi.rsem$counts)
+# rownames(txi.rsem$counts)[1:5] # these are Ensemble IDs. Convert to gene names
+# 
+# dfGenes<- dfGenes[match(rownames(txi.rsem$counts), dfGenes$ID),]
+# dfGenes$GeneName <- make.unique(as.character(dfGenes$GeneName)) 
+# row.names(txi.rsem$counts) <- dfGenes$GeneName
+# row.names(txi.rsem$abundance) <- dfGenes$GeneName
+# row.names(txi.rsem$length) <- dfGenes$GeneName
+# 
+# 
+# saveRDS(txi.rsem, "/data/yosef2/users/zsteier/TCRsignal/bulkRNAseq/GEO_data/txi_rsem_transcript_counts.rds")
+# # contains transcript counts, abundance, and length for each gene and each sample
+# 
+# # test loaded saved counts
+# txi_test <- readRDS("/data/yosef2/users/zsteier/TCRsignal/bulkRNAseq/GEO_data/txi_rsem_transcript_counts.rds")
+# head(txi_test)
+```
+
+```{r Save normalized counts}
+# deRNA <- DESeq(dedsRNASeq)
+# dfNormalizedCounts <- as.data.frame(counts(deRNA, normalized = TRUE))
+# dfNormalizedCounts[1:5, 1:5]
+# 
+# write.csv(dfNormalizedCounts, "/data/yosef2/users/zsteier/TCRsignal/bulkRNAseq/GEO_data/normalized_counts.csv")
+# 
+# norm_test <- read_csv("/data/yosef2/users/zsteier/TCRsignal/bulkRNAseq/GEO_data/normalized_counts.csv")
+# norm_test[1:5, 1:5]
+```
+
+## Filter genes
+```{r Collect names of genes to remove}
+
+# Remove TCR genes (because these are TCR transgenics, so these genes are manipulated intentionally)
+# Remove genes from H2 locus because TG6 has a different H2 locus from OT-1 and F5
+# Remove Rag1 and Rag2 because OT-1 is Rag2-KO, F5 is Rag1-KO, and TG6 is Rag1 WT
+# Remove genes that are F5 or OT-1 Specific
+
+
+all_genes <- row.names(dedsRNASeq)
+
+patterns <- c("Traj.*", "Trav.*", "Trbc.*", "Trbd.*", "Trbv.*", "Trbj.*", "Trdv.*", "Trdj.*", "Trdc.*", "Trdd.*", "Trgj.*", "Trgv.*", "Trac.*", # TCR genes
+              "H2-.*", "Tap1", "Tap2", "Tapbp", "Tapbpl", "Psmb8", "Psmb9", # H2 genes
+              "Rag1", "Rag2" # Rag genes
+              ) # mouse-specific genes
+
+length(all_genes[grepl(str_c(patterns, collapse="|"), all_genes)]) 
+length(all_genes) 
+
+```
+
+```{r Filter out manually selected genes}
+# Now filter manually selected genes
+dedsRNASeq_filt_man <- dedsRNASeq_filt[!(grepl(str_c(patterns, collapse="|"), row.names(dedsRNASeq_filt))), ]
+dim(dedsRNASeq_filt_man) 
+
+```
+
+# Plot heatmaps
+
+## Ion transport gene expression heatmap
+
+```{r Load gene list}
+
+gene_list_ion <- read_csv("data/genes_iontransport.csv", col_names = c("Genes"))[[1]]
+gene_list <- gene_list_ion
+
+length(gene_list)
+```
+
+
+```{r Summarize data to plot}
+# Apply vsd to all data
+vsd_alltimes <- vst(dedsRNASeq_filt_man, blind=FALSE) # Take vst of each time point, results is list of DESeq objects
+
+# Get metadata for all data
+meta_alltimes <- all_coldata %>%
+  mutate(Stage = str_replace(str_replace(strCellType, "_CD8", ""), "-", "")) %>%
+  dplyr::select("Sample_name" = strSampleName, "TCR_type" = strTCRType, Stage)
+
+# Combine all data into one tibble for plotting
+heatdata_t <- as_tibble(rownames_to_column(as.data.frame(t(assay(vsd_alltimes))), var = "Sample_name"))
+dim(heatdata_t)
+heatdata_t[1:5, 1:5]
+
+# Select genes of interest here to make the size of the dataframe much smaller
+heatdata_t <- heatdata_t %>%
+  select(Sample_name, all_of(gene_list))
+
+heatdata_tnew <- heatdata_t %>%
+  left_join(meta_alltimes, by = "Sample_name") %>%
+  dplyr::select(-c(Sample_name)) %>%
+  group_by(TCR_type, Stage) %>%
+  summarize_at(vars(-group_cols()), mean) %>% # get mean across replicates for TCR types
+  arrange(factor(Stage, levels = c("immature", "semimature", "mature")), factor(TCR_type, levels = c("TG6", "F5", "OT1"))) # arrange by Stage, then TCR
+
+# Extract annotations, now in the correct order
+annotations <- data.frame(heatdata_tnew %>% dplyr::select(TCR_type, Stage))
+
+# Transpose gene expression and rename samples
+heatdata <- heatdata_tnew %>% unite(col = "Stage_TCR", c("Stage", "TCR_type"), sep = "_", remove = TRUE)
+combined_sample_names <- heatdata$Stage_TCR
+heatdata_samplebygene <- t(heatdata %>% dplyr::select(-c("Stage_TCR")))
+colnames(heatdata_samplebygene) <- combined_sample_names
+
+# Give annotations row names that match column names of heatdata
+row.names(annotations) <- combined_sample_names
+
+```
+
+
+```{r Plot and save as png files}
+
+gene_data_subset <- heatdata_samplebygene
+
+g = pheatmap(gene_data_subset,
+         cluster_rows=TRUE,
+         show_rownames=TRUE,
+         show_colnames = FALSE,
+         cluster_cols=FALSE,
+         annotation_col=annotations,
+         angle_col = 90,
+         annotation_colors = list(Stage = c(immature = "lightsteelblue1", semimature = "steelblue1", mature = "steelblue4"),
+                                  TCR_type = c(TG6 = "green", F5 = "blue", OT1 = "red")),
+         border_color = NA,
+         color = colorRampPalette(rev(brewer.pal(10, "RdBu")))(100), #viridis(100),brewer.rdbu(100
+         gaps_col = c(3, 6),
+         cutree_rows = 4, # add gaps when rows are clustered (based on the hierarchy)
+         #clustering_distance_rows = "correlation",
+         scale = "row", # scale colors per row
+         #main = plottitle, # title,
+         cellheight = 8,
+         cellwidth = 20, # 30
+         treeheight_row = 25, # default 50
+         filename = str_c("figures/heatmap_iontransport.png")
+       )
+
+# For viewing only
+heatmap_iontransport = pheatmap(gene_data_subset, 
+         cluster_rows=TRUE, 
+         show_rownames=TRUE, 
+         show_colnames = FALSE,
+         cluster_cols=FALSE,
+         annotation_col=annotations,
+         angle_col = 90,
+         annotation_colors = list(Stage = c(immature = "lightsteelblue1", semimature = "steelblue1", mature = "steelblue4"),
+                                  TCR_type = c(TG6 = "green", F5 = "blue", OT1 = "red")),
+         border_color = NA,
+         color = colorRampPalette(rev(brewer.pal(10, "RdBu")))(100), 
+         gaps_col = c(3, 6),
+         cutree_rows = 4, # add gaps when rows are clustered (based on the hierarchy)
+         scale = "row", # scale colors per row
+         cellheight = 5,
+         cellwidth = 20
+       ) 
+
+```
+
+## Plot preselection genes
+```{r Load preselection gene list}
+gene_list_additional <- read_csv("data/genes_preselDP.csv", col_names = c("Genes"))[[1]]
+gene_list <- gene_list_additional 
+
+length(gene_list) 
+```
+
+
+```{r Plot DP presel gene list}
+
+# Combine all data into one tibble for plotting
+heatdata_t <- as_tibble(rownames_to_column(as.data.frame(t(assay(vsd_alltimes))), var = "Sample_name")) 
+dim(heatdata_t) 
+heatdata_t[1:5, 1:5]
+
+# Select genes of interest here to make the size of the dataframe much smaller
+heatdata_t <- heatdata_t %>%
+  select(Sample_name, all_of(gene_list))
+
+heatdata_tnew <- heatdata_t %>%
+  left_join(meta_alltimes, by = "Sample_name") %>%
+  dplyr::select(-c(Sample_name)) %>%
+  group_by(TCR_type, Stage) %>%
+  summarize_at(vars(-group_cols()), mean) %>% # get mean across replicates for TCR types
+  arrange(factor(Stage, levels = c("immature", "semimature", "mature")), factor(TCR_type, levels = c("TG6", "F5", "OT1"))) # arrange by Stage, then TCR
+
+# Extract annotations, now in the correct order
+annotations <- data.frame(heatdata_tnew %>% dplyr::select(TCR_type, Stage))
+
+# Transpose gene expression and rename samples
+heatdata <- heatdata_tnew %>% unite(col = "Stage_TCR", c("Stage", "TCR_type"), sep = "_", remove = TRUE)
+combined_sample_names <- heatdata$Stage_TCR
+heatdata_samplebygene <- t(heatdata %>% dplyr::select(-c("Stage_TCR")))
+colnames(heatdata_samplebygene) <- combined_sample_names
+
+# Give annotations row names that match column names of heatdata
+row.names(annotations) <- combined_sample_names
+
+
+gene_data_subset_presel <- heatdata_samplebygene
+
+g = pheatmap(gene_data_subset_presel,
+         cluster_rows=TRUE,
+         show_rownames=TRUE,
+         show_colnames = FALSE,
+         cluster_cols=FALSE,
+         annotation_col=annotations,
+         angle_col = 90,
+         annotation_colors = list(Stage = c(immature = "lightsteelblue1", semimature = "steelblue1", mature = "steelblue4"),
+                                  TCR_type = c(TG6 = "green", F5 = "blue", OT1 = "red")),
+         border_color = NA,
+         color = colorRampPalette(rev(brewer.pal(10, "RdBu")))(100), 
+         gaps_col = c(3, 6),
+
+         scale = "row", # scale colors per row
+
+         cellheight = 12,
+         cellwidth = 20, 
+         treeheight_row = 25,
+         filename = str_c("figures/heatmap_preselDP.png")
+       )
+
+# For viewing
+pheatmap(gene_data_subset_presel,
+         cluster_rows=TRUE,
+         show_rownames=TRUE,
+         show_colnames = FALSE,
+         cluster_cols=FALSE,
+         annotation_col=annotations,
+         angle_col = 90,
+         annotation_colors = list(Stage = c(immature = "lightsteelblue1", semimature = "steelblue1", mature = "steelblue4"),
+                                  TCR_type = c(TG6 = "green", F5 = "blue", OT1 = "red")),
+         border_color = NA,
+         color = colorRampPalette(rev(brewer.pal(10, "RdBu")))(100), 
+         gaps_col = c(3, 6),
+         scale = "row", # scale colors per row
+         cellheight = 8,
+         cellwidth = 20, 
+         treeheight_row = 25
+       )
+
+```
+
+## Immgen heatmap
+
+```{r Load Immgen data}
+
+immgen <- read_csv("data/Immgen_DN4_to_SP.csv") # data were downloaded from ImmGen
+
+dim(immgen)
+
+# Convert to dataframe
+immgen_df <- as.data.frame(immgen %>% select(-c("GeneSymbol")))
+row.names(immgen_df) <- immgen$GeneSymbol
+```
+
+```{r Plot Immgen data ordering rows as in our data}
+# extract row order from previous heatmap
+row_order <- heatmap_iontransport$tree_row$order
+
+# Find gene names in order, and reorder immgen data accordingly
+gene_order <- row.names(gene_data_subset)[row_order]
+# Remove the missing gene
+genes_to_include <- (gene_order %in% row.names(immgen_df))
+gene_order[!(genes_to_include)] # The missing gene is Mcu
+immgen_order <- gene_order[genes_to_include]
+
+# Find breaks
+heat_clust <- cutree(heatmap_iontransport$tree_row, k = 4)[row_order][genes_to_include] # find clusters, put in order, remove the missing gene
+cut_locations <- seq(length(heat_clust))[!duplicated(heat_clust)] -1 # duplicated gives indices of duplicated entries, so take the unique ones
+
+g = pheatmap(immgen_df[immgen_order, ], 
+         cluster_rows=FALSE, 
+         show_rownames=TRUE, 
+         show_colnames = TRUE,
+         cluster_cols=FALSE,
+         angle_col = 90,
+         border_color = NA,
+         color = colorRampPalette(rev(brewer.pal(10, "RdBu")))(100),
+         gaps_row = cut_locations,
+         scale = "row", # scale colors per row
+         cellheight = 8,
+         cellwidth = 30,
+         filename = str_c("figures/heatmap_immgen_setorder_gaps.png")
+       ) 
+
+pheatmap(immgen_df[immgen_order, ], 
+         cluster_rows=FALSE, 
+         show_rownames=TRUE, 
+         show_colnames = TRUE,
+         cluster_cols=FALSE,
+         angle_col = 90,
+         border_color = NA,
+         color = colorRampPalette(rev(brewer.pal(10, "RdBu")))(100),
+         gaps_row = cut_locations, # cuts locations are after the cut, this input is index before the cut
+         scale = "row", # scale colors per row
+         cellheight = 4,
+         cellwidth = 20
+       ) 
+```
+

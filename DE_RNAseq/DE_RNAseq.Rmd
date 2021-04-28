@@ -1,0 +1,344 @@
+---
+title: "DE on RNA-seq data"
+output: html_notebook
+---
+
+Zoë Steier
+
+Use bulk RNA-seq data to find DE between TCR transgenic mice with different TCR signal strengths.
+
+# Load packages
+
+```{r Load required packages, message=FALSE, warning=FALSE}
+
+library(DESeq2)
+library(tximport)
+library(tidyverse)
+
+c_strConfig <- "../Figures/data/ConfigFile_RobeyTCR.tab"
+
+```
+
+
+# Load data
+
+## Load metadata
+```{r Load all conditions}
+
+# Make dfConditions - This is the metadata for your set of samples.
+dfConditions <- data.frame(read_tsv(c_strConfig,comment="#"))
+rownames(dfConditions) <- dfConditions$strSampleName
+dfConditions$strCellType <- str_replace(dfConditions$strCellType," ","_")
+
+# Sort metadata and expression data.
+dfConditions <- dfConditions[order(dfConditions$strSampleName),]
+
+dfConditions$strDay = str_replace(dfConditions$strTimePoint,"-CL.*","")
+dfConditions$strDay = paste0("Day",dfConditions$strDay)
+
+dfConditions$strTCRandDay = paste(dfConditions$strTCR,dfConditions$strDay,sep=".")
+
+cat(unique(dfConditions$strTCRandDay))
+
+dfConditions$RepGroup <- dfConditions$strTCRandDay
+
+dfConditions$strTCRType = factor(dfConditions$strTCRType,levels=c("F5","OT1","TG6","CD8_polyclonal","2D2","AND","OT2","CD4_polyclonal"))
+dfConditions$RepGroup <- paste(dfConditions$strTCRType,dfConditions$strCellType,dfConditions$strCellSort,sep=" - ")
+
+dfConditions[1:5,]
+```
+
+
+```{r Load one stage at a time}
+tcr_conditions <- dfConditions[!(grepl("GRA6", dfConditions$strSampleName)),] # exclude all GRA6 mice
+
+# Coldata for testing each stage at a time
+immature_coldata <- tcr_conditions[tcr_conditions$strCellType == "immature_CD8",]
+semimature_coldata <- tcr_conditions[tcr_conditions$strCellType == "semi-mature_CD8",]
+mature_coldata <- tcr_conditions[tcr_conditions$strCellType == "mature_CD8",]
+
+# Coldata for all days
+all_coldata <- tcr_conditions[tcr_conditions$strCellType %in% c("immature_CD8", "semi-mature_CD8", "mature_CD8"),]
+
+row.names(immature_coldata)
+row.names(semimature_coldata)
+row.names(mature_coldata)
+
+dim(tcr_conditions)
+```
+
+## Load count data
+
+```{r Load RSEM RNA-seq data}
+# Load RSEM Count Data
+### Note: future users should obtain this data from GEO: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE164896
+
+# This is a unix 'glob' pattern to get all of your samples. Print out this variable, and make sure it has all of your files.
+astrRSEMGeneResults <- Sys.glob("/data/yosef2/RobeyLab/TCRtoCD4OrCD8/out/RNASeq_Round*/IndividualSamples/*/rsem_output/rsem_output.genes.results") 
+
+# This part will vary from project to project. The function here splits the absolute path to the rsem file by "/", and tries 
+# to retrieve the part that refers to to sample name. Please change  "x[9]"" to refer to the part of the path that has the 
+# name. For example: If your pattern is "/data/yosef/project/data/sample1/rsem_output.genes.results". You will want to use
+# x[6] to retrieve "sample1". (R counts starting at 1, and the first spot is array this array would be empty.)
+vstrNames <- unlist(lapply( str_split(astrRSEMGeneResults,pattern="/"), function(x) x[9])) 
+
+names(astrRSEMGeneResults) <- vstrNames
+astrRSEMGeneResults <- astrRSEMGeneResults[order(vstrNames)]
+
+# Can filter out samples if needed. Here I cut these down to just samples in dfConditions.
+astrRSEMGeneResults <- astrRSEMGeneResults[names(astrRSEMGeneResults) %in% dfConditions$strSampleName]
+txi.rsem <- tximport(astrRSEMGeneResults, type = "rsem") # Import all sample counts
+
+# Dictionary of RSEM IDs --> GeneNames 
+dfGenes <-read.table("/data/yosef/index_files/mm10/rsem_files/mm10std_Ensemble_RSEM_Dictionary.tab",sep="\t",comment.char="#")
+colnames(dfGenes) <- c("ID","GeneName","GeneType")
+```
+
+
+## Load data per stage
+```{r Load data per stage}
+
+# Immature
+astrRSEMGeneResults_immature <- astrRSEMGeneResults[names(astrRSEMGeneResults) %in% immature_coldata$strSampleName]
+txi.rsem_immature <- tximport(astrRSEMGeneResults_immature, type = "rsem")
+
+# Semi-mature
+astrRSEMGeneResults_semimature <- astrRSEMGeneResults[names(astrRSEMGeneResults) %in% semimature_coldata$strSampleName]
+txi.rsem_semimature <- tximport(astrRSEMGeneResults_semimature, type = "rsem")
+
+# Mature
+astrRSEMGeneResults_mature <- astrRSEMGeneResults[names(astrRSEMGeneResults) %in% mature_coldata$strSampleName]
+txi.rsem_mature <- tximport(astrRSEMGeneResults_mature, type = "rsem")
+
+# All stages of CD8
+astrRSEMGeneResults_all <- astrRSEMGeneResults[names(astrRSEMGeneResults) %in% all_coldata$strSampleName]
+txi.rsem_all <- tximport(astrRSEMGeneResults_all, type = "rsem")
+
+```
+
+
+# Run DESeq2
+
+```{r Make tibble to store tests to run}
+tests <- tibble("Stage" = c("immature", "immature", "immature", "semimature", "semimature", "semimature", "semimature", "semimature", "semimature", "mature", "mature", "mature", "mature", "mature", "mature"), "Group1" = c("F5", "F5", "OT1", "F5", "F5", "F5", "OT1", "OT1", "TG6", "F5", "F5", "F5", "OT1", "OT1", "TG6"), "Group2" = c("OT1", "TG6", "TG6", "OT1", "TG6", "CD8_polyclonal", "TG6", "CD8_polyclonal", "CD8_polyclonal", "OT1", "TG6", "CD8_polyclonal", "TG6", "CD8_polyclonal", "CD8_polyclonal"))
+
+tests
+```
+
+
+```{r Make function to collect DESeq2 results}
+
+RunDESeq2 <- function(stage, coldata, txi_data){
+  # coldata: metadata for this test
+  # txi_data: RNAseq data imported with txi.import
+  # Stage: selection of which contrasts to run
+  
+  
+  # Prepare DESeq test design
+  txi.rsem = txi_data
+  txi.rsem$length[txi.rsem$length == 0] <- 1
+  dedsRNASeq <- DESeqDataSetFromTximport(txi.rsem, # un-normalized read counts from RSEM output
+                                   colData = coldata,
+                                   design = ~ strTCRType)
+  
+  # Annotate data with gene names
+  dfGenes<- dfGenes[match(rownames(dedsRNASeq), dfGenes$ID),]
+  dfGenes$GeneName <- make.unique(as.character(dfGenes$GeneName)) 
+
+  all(rownames(dedsRNASeq) == dfGenes$ID)
+  mcols(dedsRNASeq) <- cbind(mcols(dedsRNASeq), dfGenes)
+  rownames(dedsRNASeq) <- dfGenes$GeneName
+  
+  # Run DESeq2
+  deRNA <- DESeq(dedsRNASeq) # deRNA contains DE results
+
+  
+  # Extract pairwise results by specifying contrasts
+  DESeq2_SimpleContrast <- function(Group1, Group2){
+    # deRNA is DEseq2 results
+    # test tibble contains stage of cells, group1 to test, group2 to test
+    var = "strTCRType"
+    comparison <- str_c(var, "_", Group1, "_vs_", Group2) # name of test to include in results
+    
+    print(str_c("Running Test: ", comparison))
+    # 
+    # Group1 <- test_tibble$Group1
+    # Group2 <- test_tibble$Group2
+    
+    res_deRNA <- results(deRNA, contrast=c(var, Group1, Group2), alpha=0.05)
+    
+    # Make results into tibble
+    tbDE <- as_tibble(res_deRNA)
+    tbDE$Gene <- rownames(res_deRNA)
+  
+    tbDE$DEGenes <- NA
+    tbDE$DEGenes[tbDE$log2FoldChange>0 & tbDE$padj<0.05] <- Group1
+    tbDE$DEGenes[tbDE$log2FoldChange<0 & tbDE$padj<0.05] <- Group2
+    
+    # colnames(tbDE)
+    tbDE <- tbDE %>% dplyr::select(log2FoldChange,pvalue,padj,DEGenes,Gene) #DEGenes
+    
+    colnames(tbDE)[1:4] <- paste(str_c(Group1, "_vs_", Group2),colnames(tbDE)[1:4],sep="_") # don't add to Gene column
+  
+    return(tbDE)
+  }
+  
+  # Extract contrasts (pairwise DE results)
+  liResults <- tests %>% 
+    filter(Stage == stage) %>% 
+    select(-Stage) %>%
+    pmap(DESeq2_SimpleContrast)
+  
+  
+  # Merge results
+  MergeDE <- function(tbLeft,tbRight){
+    left_join(tbLeft,tbRight,by=c("Gene"))
+  }
+  
+  tbDEMerged <- Reduce(MergeDE,liResults)
+  tbDEMerged <- tbDEMerged %>%
+    select(Gene, everything())
+  
+  return(list("tbDEMerged" = tbDEMerged, "dedRNASeq" = dedsRNASeq)) # return dedsRNASeq for PCA
+
+}
+
+```
+
+
+```{r Run tests and collect results}
+DE_immature <- RunDESeq2(stage = "immature", coldata = immature_coldata, txi_data = txi.rsem_immature)
+DE_semimature <- RunDESeq2(stage = "semimature", coldata = semimature_coldata, txi_data = txi.rsem_semimature)
+DE_mature <- RunDESeq2(stage = "mature", coldata = mature_coldata, txi_data = txi.rsem_mature)
+
+
+DE_immature$tbDEMerged
+```
+
+
+```{r Save DE results}
+
+getwd()
+
+write_csv(DE_immature$tbDEMerged, "DE_results/DESeq2_TCRsignal_CD8_immature.csv")
+write_csv(DE_semimature$tbDEMerged, "DE_results/DESeq2_TCRsignal_CD8_semimature.csv")
+write_csv(DE_mature$tbDEMerged, "DE_results/DESeq2_TCRsignal_CD8_mature.csv")
+
+```
+
+
+```{r View results}
+# View results
+DE_immature$tbDEMerged %>%
+  arrange(OT1_vs_TG6_padj)
+  #filter(Gene %in% c("Cd5", "Nr4a1"))
+
+
+DE_semimature$tbDEMerged %>%
+  arrange(OT1_vs_TG6_padj)
+  #filter(Gene %in% c("Cd5", "Nr4a1"))
+
+DE_mature$tbDEMerged %>%
+  arrange(OT1_vs_TG6_padj)
+  #filter(Gene %in% c("Cd5", "Nr4a1"))
+```
+
+# Run DESeq2 and save stats for GSEA
+
+```{r Function to run DESeq2 and collect stats}
+RunDESeq2_withStats <- function(stage, coldata, txi_data){
+  # coldata: metadata for this test
+  # txi_data: RNAseq data imported with txi.import
+  # Stage: selection of which contrasts to run
+  
+  # Prepare DESeq test design
+  txi.rsem = txi_data
+  txi.rsem$length[txi.rsem$length == 0] <- 1
+  dedsRNASeq <- DESeqDataSetFromTximport(txi.rsem, # un-normalized read counts from RSEM output
+                                   colData = coldata,
+                                   design = ~ strTCRType)
+  
+  # Annotate data with gene names
+  dfGenes<- dfGenes[match(rownames(dedsRNASeq), dfGenes$ID),]
+  dfGenes$GeneName <- make.unique(as.character(dfGenes$GeneName)) 
+
+  all(rownames(dedsRNASeq) == dfGenes$ID)
+  mcols(dedsRNASeq) <- cbind(mcols(dedsRNASeq), dfGenes)
+  rownames(dedsRNASeq) <- dfGenes$GeneName
+  
+  # Run DESeq2
+  deRNA <- DESeq(dedsRNASeq) # deRNA contains DE results
+
+  
+  # Extract pairwise results by specifying contrasts
+  DESeq2_SimpleContrast <- function(Group1, Group2){
+    # deRNA is DEseq2 results
+    # test tibble contains stage of cells, group1 to test, group2 to test
+    var = "strTCRType"
+    comparison <- str_c(var, "_", Group1, "_vs_", Group2) # name of test to include in results
+    
+    print(str_c("Running Test: ", comparison))
+    # 
+    # Group1 <- test_tibble$Group1
+    # Group2 <- test_tibble$Group2
+    
+    res_deRNA <- results(deRNA, contrast=c(var, Group1, Group2), alpha=0.05)
+    
+    # Make results into tibble
+    tbDE <- as_tibble(res_deRNA)
+    tbDE$Gene <- rownames(res_deRNA)
+  
+    tbDE <- tbDE %>% dplyr::select(Gene, stat)
+    
+    colnames(tbDE)[2] <- paste(str_c(Group1, "_vs_", Group2),colnames(tbDE)[2],sep="_") # don't add to Gene column
+  
+    return(tbDE)
+  }
+  
+  # Extract contrasts (pairwise DE results)
+  liResults <- tests %>% 
+    filter(Stage == stage) %>% 
+    dplyr::select(-Stage) %>%
+    pmap(DESeq2_SimpleContrast)
+  
+  
+  # Merge results
+  MergeDE <- function(tbLeft,tbRight){
+    left_join(tbLeft,tbRight,by=c("Gene"))
+  }
+  
+  tbDEMerged <- Reduce(MergeDE,liResults)
+  tbDEMerged <- tbDEMerged %>%
+    dplyr::select(Gene, everything())
+  
+  return(tbDEMerged) # just return the Wald stat with gene name
+
+}
+
+```
+
+
+```{r Run DE to find Wald stat}
+DE_immature_stat <-RunDESeq2_withStats(stage = "immature", coldata = immature_coldata, txi_data = txi.rsem_immature)
+colnames(DE_immature_stat)[-1] <- str_c(colnames(DE_immature_stat)[-1], "_immature")
+
+DE_semimature_stat <- RunDESeq2_withStats(stage = "semimature", coldata = semimature_coldata, txi_data = txi.rsem_semimature)
+colnames(DE_semimature_stat)[-1] <- str_c(colnames(DE_semimature_stat)[-1], "_semimature")
+
+DE_mature_stat <- RunDESeq2_withStats(stage = "mature", coldata = mature_coldata, txi_data = txi.rsem_mature)
+colnames(DE_mature_stat)[-1] <- str_c(colnames(DE_mature_stat)[-1], "_mature")
+
+```
+
+
+```{r Collect Wald stat}
+DESeq2_WaldStat <- DE_immature_stat %>%
+  full_join(DE_semimature_stat, by = "Gene") %>%
+  full_join(DE_mature_stat, by = "Gene")
+```
+
+```{r Save DESeq2 results with stats for GSEA}
+
+write_csv(DESeq2_WaldStat, "DE_results/DESeq2_TCRsignal_CD8_all_WaldStat.csv")
+```
+

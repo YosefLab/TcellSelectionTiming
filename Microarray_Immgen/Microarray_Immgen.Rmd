@@ -1,0 +1,298 @@
+---
+title: "Analysis of Immgen Microarray Data"
+output: html_notebook
+---
+
+Zoë Steier
+
+Run DE and GSEA on Immgen microarray samples. Start with data from GEO.
+
+# Load required packages
+```{r Load pacakges}
+
+# For microarray data analysis with limma
+library(Biobase)
+library(GEOquery)
+library(limma)
+
+# For fgsea
+library(tidyverse)
+library(rlang)
+library(stringr)
+library(purrr)
+library(org.Mm.eg.db)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(stringr)
+library(fgsea)
+library(parallel)
+library(openxlsx)
+library(BiocParallel)
+register(MulticoreParam(workers = 5))
+```
+
+
+# Differential expression analysis with limma
+## Load series and platform data from GEO
+
+```{r Load data from GEO}
+
+gset <- getGEO("GSE15907", GSEMatrix =TRUE, AnnotGPL=TRUE)
+if (length(gset) > 1) idx <- grep("GPL6246", attr(gset, "names")) else idx <- 1
+gset <- gset[[idx]]
+
+# make proper column names to match toptable 
+fvarLabels(gset) <- make.names(fvarLabels(gset))
+
+head(gset)
+colnames(gset)
+```
+
+## Select samples of interest
+```{r Select the samples of interest}
+DN4_samples <- c("GSM791154", "GSM791155", "GSM791156") # Three replicates of DN4 T cells
+DP_samples <- c("GSM399391", "GSM399392", "GSM399393") # Three replicates of DP T cells
+DP69_samples <- c("GSM399394", "GSM399395", "GSM399396") # Three replicates of CD69+ DP T cells
+
+all_samples <- c(DN4_samples, DP_samples, DP69_samples)
+```
+
+```{r Subset geo data by sample of interest}
+gset <- gset[, all_samples]
+colnames(gset)
+```
+
+## Normalize the data
+
+One sample: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSM791154 "Output on 2^ scale" (don't need to log transform since the data has already been RMA normalized, including log2).
+
+## DE with limma
+
+Bioconductor manual for DE analysis with limma on microarray data: http://manuals.bioinformatics.ucr.edu/home/R_BioCondManual#TOC-Limma:-Affymetrix-Arrays.
+Limma user guide: https://www.bioconductor.org/packages/devel/bioc/vignettes/limma/inst/doc/usersguide.pdf
+- See example for several groups (comparison between 3 things)
+GEO2R info: https://www.ncbi.nlm.nih.gov/geo/info/geo2r.html#how_to_use
+
+```{r Set up data for limma DE}
+# set up the data and proceed with analysis
+
+# Set groups: 1: DN4, 2: DP, 3: DP69
+groups <- factor(c("DN4", "DN4", "DN4", "DP", "DP", "DP", "DP69", "DP69", "DP69"))
+gset$description <- groups
+design <- model.matrix(~ description + 0, gset)
+colnames(design) <- levels(groups)
+fit <- lmFit(gset, design)
+cont.matrix <- makeContrasts(DP-DN4, DP-DP69, DN4-DP69, levels=design) # make all pairwise comparisons
+
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2, 0.01)
+tT <- topTable(fit2, adjust="fdr", sort.by="B", number=250, coef = 3) # fdr with the Benjamini-Hochberg correction (aka "BH" is the same as "fdr"), sort.by="B" (Bayes) for two groups
+# add coef = 1 (which contrast to show results for)
+
+tT <- subset(tT, select=c("ID","adj.P.Val","P.Value","t","B","logFC","Gene.symbol","Gene.title"))
+write.table(tT, file=stdout(), row.names=F, sep="\t")
+
+colnames(tT)
+results_tibble <- as_tibble(tT) %>%
+  arrange((logFC))
+```
+
+```{r Save results}
+# Results: Save each contrast
+tT1 <- topTable(fit2, adjust="fdr", sort.by="B", number=50000, coef = 1)
+tT1 <- subset(tT1, select=c("ID","adj.P.Val","P.Value","t","B","logFC","Gene.symbol","Gene.title"))
+results1 <- as_tibble(tT1) %>%
+  arrange(desc(logFC))
+
+tT2 <- topTable(fit2, adjust="fdr", sort.by="B", number=50000, coef = 2)
+tT2 <- subset(tT2, select=c("ID","adj.P.Val","P.Value","t","B","logFC","Gene.symbol","Gene.title"))
+results2 <- as_tibble(tT2) %>%
+  arrange(desc(logFC))
+
+tT3 <- topTable(fit2, adjust="fdr", sort.by="B", number=50000, coef = 3)
+tT3 <- subset(tT3, select=c("ID","adj.P.Val","P.Value","t","B","logFC","Gene.symbol","Gene.title"))
+results3 <- as_tibble(tT3) %>%
+  arrange((logFC))
+
+write_csv(results1, "limma_ImmgenMicroarray_DP_DN4.csv")
+write_csv(results2, "limma_ImmgenMicroarray_DP_DP69.csv")
+write_csv(results3, "limma_ImmgenMicroarray_DN4_DP69.csv")
+
+```
+
+```{r Find DP genes}
+# Find genes that are upregulated in DP relative to DN4 and DP69
+# Use the moderated t statistic from limma for sorting in GSEA
+
+DP1 <- results1 %>% 
+  filter(logFC > 0) %>%
+  group_by(Gene.symbol) %>%
+  summarize(mean_stat = mean(t)) %>% # take mean for multiple probes of the same gene
+  filter(!(Gene.symbol == "")) # remove genes with no gene symbol
+
+DP2 <- results2 %>% 
+  filter(logFC > 0) %>%
+  group_by(Gene.symbol) %>%
+  summarize(mean_stat = mean(t)) %>% 
+  filter(!(Gene.symbol == "")) 
+
+DP_both <- DP1 %>%
+  inner_join(DP2, by = "Gene.symbol") %>% # keep only genes that are upregulated in both lists
+  rowwise() %>%
+  mutate(mean_stat = mean(c(mean_stat.x, mean_stat.y))) %>%
+  arrange(desc(mean_stat))
+```
+
+# GSEA
+## Find gene names and signatures to test
+
+```{r Convert mouse gene symbols to human for comparison with ImmSig databases}
+
+# Map mouse symbols to human symbols
+martMouse <- biomaRt::useDataset("mmusculus_gene_ensembl", mart=useMart("ensembl"))
+orgdb_Species <- org.Mm.eg.db
+
+bmMouse <- getBM(attributes=c("ensembl_gene_id","hsapiens_homolog_associated_gene_name"),mart=martMouse)
+    
+# Note: biomart will not allow me to retrieve all three attribute (gene id, gene symbol, human homolog)
+# in one call of getBM, so I do these separately and merge.
+bmSymbol <- getBM(attributes=c("mgi_symbol","ensembl_gene_id"),mart=martMouse)
+
+tbMouseSymbol_to_MouseENSEMBL <-  bmSymbol %>% distinct() %>% as_tibble() %>% na_if("") %>% na.omit() %>% 
+  dplyr::select(Symbol=mgi_symbol,ENSEMBL=ensembl_gene_id)
+
+tbMouseENSEMBL_to_HumanSymbol<- bmMouse %>% distinct() %>% as_tibble() %>% na_if("") %>% na.omit() %>% 
+  dplyr::select(ENSEMBL=ensembl_gene_id,Human_Symbol=hsapiens_homolog_associated_gene_name)
+
+tbMouseSymbol_to_HumanSymbol <- dplyr::inner_join(tbMouseSymbol_to_MouseENSEMBL , tbMouseENSEMBL_to_HumanSymbol,by="ENSEMBL") %>% 
+  dplyr::select(Symbol,Human_Symbol)
+
+tbMapping <- tbMouseSymbol_to_HumanSymbol
+```
+```{r Find mouse symbol names in microarray data}
+microarray_symbols <- DP_both$Gene.symbol
+mouse_symbols <- tbMapping$Symbol
+
+sum(mouse_symbols %in% microarray_symbols) 
+
+DP_both %>%
+  filter(str_detect(Gene.symbol, "///")) 
+
+# Recover a few genes by spliting at "///" and taking the first listed gene name (some of them are just duplicated)
+DP_both <- DP_both %>%
+  mutate(Symbol = str_replace(Gene.symbol, "///.*", ""))
+
+sum(mouse_symbols %in% DP_both$Symbol) # Use DP_both$Symbol as gene name
+
+```
+
+
+
+```{r Get signature collections for fgsea}
+# Gene sets can be downloaded from MSigDB
+gmtC5 <- fgsea::gmtPathways("/data/yosef2/users/david.detomaso/Signatures/MSIGDB/c5.all.v4.0.symbols.gmt")
+
+```
+
+## Run fgsea
+
+```{r Run one fgsea test for DP vs DN4}
+# Get human gene names and test statistic
+gene_sets <- list("C5" = gmtC5)
+test_stat <- results1 %>%
+  mutate(Symbol = str_replace(Gene.symbol, "///.*", "")) %>%
+  group_by(Symbol) %>%
+  summarize(mean_stat = mean(t)) %>%
+  filter(!(Symbol == "")) %>%
+  ungroup() %>%
+  dplyr::select(c(Symbol, mean_stat)) %>%
+  inner_join(tbMapping, by = "Symbol") %>% # convert to human names
+  dplyr::select(Human_Symbol, mean_stat) %>% # keep just human gene name
+  na.omit() %>% # remove rows with no human gene name
+  group_by(Human_Symbol) %>%
+  summarize(mean_stat_hu = mean(mean_stat)) %>% # take mean of human gene names
+  arrange(desc(mean_stat_hu)) %>% # sort from highest to lowest Wald Stat
+  deframe()
+
+# Run fgsea
+res_fgsea <- fgsea(pathways=gmtC5,
+                   stats=test_stat,
+                   nperm=1000,
+                   nproc=5)
+tbGSEA <- res_fgsea %>% 
+  as_tibble() %>% 
+  arrange(desc(NES)) %>% # NES – enrichment score normalized to mean enrichment of random samples of the same size
+  dplyr::select(pathway, padj, NES)
+
+write_csv(tbGSEA, "C5_DPvsDN4.csv")
+```
+
+```{r Run one fgsea test for DP vs DP69}
+# Get human gene names and test statistic
+gene_sets <- list("C5" = gmtC5)
+test_stat <- results2 %>%
+  mutate(Symbol = str_replace(Gene.symbol, "///.*", "")) %>%
+  group_by(Symbol) %>%
+  summarize(mean_stat = mean(t)) %>%
+  filter(!(Symbol == "")) %>%
+  ungroup() %>%
+  dplyr::select(c(Symbol, mean_stat)) %>%
+  inner_join(tbMapping, by = "Symbol") %>% # convert to human names
+  dplyr::select(Human_Symbol, mean_stat) %>% # keep just human gene name
+  na.omit() %>% # remove rows with no human gene name
+  group_by(Human_Symbol) %>%
+  summarize(mean_stat_hu = mean(mean_stat)) %>% # take mean of human gene names, now 7,446 genes
+  arrange(desc(mean_stat_hu)) %>% # sort from highest to lowest Wald Stat
+  deframe()
+
+# Run fgsea
+res_fgsea <- fgsea(pathways=gmtC5,
+                   stats=test_stat,
+                   nperm=1000,
+                   nproc=5)
+tbGSEA <- res_fgsea %>% 
+  as_tibble() %>% 
+  arrange(desc(NES)) %>% # NES – enrichment score normalized to mean enrichment of random samples of the same size
+  dplyr::select(pathway, padj, NES)
+
+write_csv(tbGSEA, "C5_DPvsDP69.csv")
+
+tbGSEA %>%
+  arrange(NES)
+```
+
+
+
+```{r Run one fgsea test for DN4 vs DP69}
+# Get human gene names and test statistic
+gene_sets <- list("C5" = gmtC5)
+test_stat <- results3 %>%
+  mutate(Symbol = str_replace(Gene.symbol, "///.*", "")) %>%
+  group_by(Symbol) %>%
+  summarize(mean_stat = mean(t)) %>%
+  filter(!(Symbol == "")) %>%
+  ungroup() %>%
+  dplyr::select(c(Symbol, mean_stat)) %>%
+  inner_join(tbMapping, by = "Symbol") %>% # convert to human names
+  dplyr::select(Human_Symbol, mean_stat) %>% # keep just human gene name
+  na.omit() %>% # remove rows with no human gene name
+  group_by(Human_Symbol) %>%
+  summarize(mean_stat_hu = mean(mean_stat)) %>% # take mean of human gene names, now 7,446 genes
+  arrange(desc(mean_stat_hu)) %>% # sort from highest to lowest Wald Stat
+  deframe()
+
+# Run fgsea
+res_fgsea <- fgsea(pathways=gmtC5,
+                   stats=test_stat,
+                   nperm=1000,
+                   nproc=5)
+tbGSEA <- res_fgsea %>% 
+  as_tibble() %>% 
+  arrange(desc(NES)) %>% # NES – enrichment score normalized to mean enrichment of random samples of the same size
+  dplyr::select(pathway, padj, NES)
+
+write_csv(tbGSEA, "C5_DN4vsDP69.csv")
+
+tbGSEA %>%
+  arrange(NES)
+```

@@ -1,0 +1,148 @@
+---
+title: "DE on CD5 high vs CD5 low T cells from Matson et al."
+output: html_notebook
+---
+
+Zoë Steier
+
+Run DE on CD5 high vs low cells (in CD4 and CD8).
+Data: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE151395 (one sample: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSM4577179)
+Paper: https://www.pnas.org/content/pnas/early/2020/06/05/1922525117.full.pdf, https://www.pnas.org/content/117/25/14342 (2020)
+
+Data processing description from GEO: 
+The 101 bp paired-end reads were aligned using STAR version 2.5.2a and reads quantified with featureCounts version 1.4.6-p3. Differential expression analysis was performed using DESeq2(71). We used a false discovery rate cutoff of < 1% to define statistical significance.
+Genome_build: mm10
+Supplementary_files_format_and_content: Raw counts table: 24421 rows x 16 sample columns + geneid column with gene symbols.
+
+
+# Load required packages
+```{r Load pacakges}
+
+# For GEO download
+library(Biobase)
+library(GEOquery)
+
+# For DESeq2
+library(DESeq2)
+library(tidyverse)
+
+# For fgsea
+library(rlang)
+library(stringr)
+library(purrr)
+library(org.Mm.eg.db)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(stringr)
+library(fgsea)
+library(parallel)
+library(openxlsx)
+library(BiocParallel)
+register(MulticoreParam(workers = 5))
+```
+
+
+# Download data from GEO
+
+```{r Load data from GEO}
+# Only run this once
+gset <- getGEOSuppFiles("GSE151395", fetch_files = TRUE) # File to download: GSE151395_raw_counts_genes.txt.gz
+getwd() 
+
+# Load the data
+geo_filepath <- row.names(gset)[1]
+
+raw <- read_tsv(geo_filepath)
+raw
+```
+# Differential expression analysis with DESeq2
+
+## Load downloaded data
+```{r Load the downloaded data}
+geo_filepath <- "/data/yosef2/users/zsteier/TCRsignal/TcellSelectionTiming/MatsonPNAS_DE/GSE151395/GSE151395_raw_counts_genes.txt.gz"
+
+raw <- read_tsv(geo_filepath)
+raw_mat <- as.matrix(raw[, -1])
+row.names(raw_mat) <- raw$geneid
+
+raw_mat[1:5, 1:5]
+dim(raw_mat)
+```
+
+## Run DESeq2
+
+1. CD4: CD5lo vs CD5hi
+2. CD8: CD5lo vs CD5hi
+
+Rank gene lists by padj and logFC.
+
+```{r Make metadata for DESeq2}
+meta <- tibble(Sample = colnames(raw)) %>%
+  filter(!(Sample == "geneid")) %>%
+  mutate(CellType_CD5 = str_replace(Sample, "_[0-9]", "")) %>%
+  separate(CellType_CD5, into = c("CellType", "CD5"), sep = "_", remove = FALSE) 
+coldata <- as.data.frame(meta)
+coldata$CellType <- as.factor(coldata$CellType)
+coldata$CellType_CD5 <- as.factor(coldata$CellType_CD5)
+coldata$CD5 <- as.factor(coldata$CD5)
+row.names(coldata) <- meta$Sample
+
+coldata
+```
+
+```{r Run DESeq2}
+# Make DESeq2 object
+dedsRNASeq <- DESeqDataSetFromMatrix(raw_mat, # un-normalized read counts from raw matrix
+                                 colData = coldata,
+                                 design = ~ CellType_CD5)
+
+# Run DESeq2
+deRNA <- DESeq(dedsRNASeq)
+
+# Extract results
+res_CD4 <- results(deRNA, contrast=c("CellType_CD5", "cd4_cd5lo", "cd4_cd5hi"), alpha=0.05)
+    
+# Make results into tibble
+tbDE4 <- as_tibble(res_CD4) %>%
+  mutate(Gene = rownames(res_CD4)) %>%
+  dplyr::select(Gene, everything()) %>%
+  arrange(desc(log2FoldChange))
+
+# View some genes of interest
+tbDE4 %>%
+  arrange(desc(log2FoldChange)) %>%
+  #filter(Gene %in% c("Kcna2", "Tmie", "Cd5"))
+  filter(Gene %in% c("Cd5", "Nfkb1", "Nfkbia", "Rela", "Nfkbib", "Ikbkb", "Chuk", "Nfkb2", "Relb"))
+
+
+# Extract results
+res_CD8 <- results(deRNA, contrast=c("CellType_CD5", "cd8_cd5lo", "cd8_cd5hi"), alpha=0.05)
+    
+# Make results into tibble
+tbDE8 <- as_tibble(res_CD8) %>%
+  mutate(Gene = rownames(res_CD8)) %>%
+  dplyr::select(Gene, everything()) %>%
+  arrange(desc(log2FoldChange))
+
+# View genes of interest
+tbDE8 %>%
+  arrange(desc(log2FoldChange)) %>%
+  filter(Gene %in% c("Kcna2", "Tmie", "Cd5", "Cd69", "Nr4a1", "Egr1", "Nfkb1", "Nfatc3"))
+
+sum(is.na(tbDE8$padj))
+
+tbDE8 %>%
+  arrange(pvalue)
+```
+Some p values are NA. See the note "Note on p-values set to NA" on DESeq2: http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html.
+-If only padj is NA, this gene didn't pass the low count filter.
+-If LFC is also NA, the baseMean was 0.
+-If pvalue is NA, there was an extreme outlier.
+
+Mostly seems due to independent filtering. Could be turned off by setting independentFiltering to FALSE when calling results().
+
+
+```{r Save results}
+write_csv(tbDE8, "DESeq2_Matson_CD8_CD5lo_vs_CD5hi.csv")
+write_csv(tbDE4, "DESeq2_Matson_CD4_CD5lo_vs_CD5hi.csv")
+```
